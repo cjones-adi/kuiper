@@ -4,3 +4,5 @@ kuiper-volume/*
 apt-cacher-ng/
 
 docs/_build/
+
+*.log

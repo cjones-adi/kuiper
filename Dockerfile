@@ -7,7 +7,7 @@ RUN apt-get -y update && \
     apt-get -y install --no-install-recommends \
         parted moreutils e2fsprogs\
         coreutils qemu-user-binfmt debootstrap zip dosfstools \
-        rsync grep xxd kmod bc udev jq \
+        rsync grep xxd kmod bc udev jq zstd \
         build-essential gcc-arm-linux-gnueabihf \
         u-boot-tools gcc-aarch64-linux-gnu gnupg \
         binfmt-support ca-certificates qemu-utils fdisk \

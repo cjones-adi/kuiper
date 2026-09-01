@@ -1,0 +1,15 @@
+# PAM service for bmcweb interactive (web UI) login.
+#
+# bmcweb authenticates the web UI login via pam_start("webserver", ...), i.e.
+# this file. It is separate from the Redfish API, which is served without auth
+# (bmcweb built with -Dinsecure-disable-auth=enabled). Without this file, PAM
+# falls back to /etc/pam.d/other (deny) and every login is rejected with 401,
+# even with correct credentials.
+#
+# Policy: only members of the 'redfish' group may log in; their Unix password is
+# verified by pam_unix. The role (priv-admin vs priv-user) is then resolved by
+# the adm1600-usermgr shim's GetUserInfo from the user's Unix groups.
+# To allow any valid local user (role decided by the shim), drop the first line.
+auth      requisite  pam_succeed_if.so user ingroup redfish quiet_success
+auth      required   pam_unix.so
+account   required   pam_unix.so

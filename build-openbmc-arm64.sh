@@ -44,9 +44,11 @@ BMCWEB_REV="b84653e71c342f965da5a631b8d2a4766a1606a7"
 # Which components to build (space-separated); default = all, in order.
 COMPONENTS="${COMPONENTS:-apt function2 stdexec stdplus sdeventplus gpioplus sdbusplus pdi logging objmgr hwmon bmcweb assoc usermgr}"
 
-# ADM1600 association shim source (compiled by the 'assoc' component). Lives in
-# the Kuiper stage dir (mounted at /work in the build container).
-SHIM_SRC="${SHIM_SRC:-/work/stages/07.extra-tweaks/09.openbmc-stack/files/adm1600-assoc.cpp}"
+# Generic config-driven association shim source (compiled by the 'assoc'
+# component). Device-agnostic: reads /etc/bmc-assoc/*.conf at runtime, so a new
+# device needs a drop-in .conf, not a recompile. Lives in the Kuiper stage dir
+# (mounted at /work in the build container).
+SHIM_SRC="${SHIM_SRC:-/work/stages/07.extra-tweaks/09.openbmc-stack/files/bmc-assoc.cpp}"
 
 GH="https://github.com"
 log() { echo -e "\n\033[1;35m=== $* ===\033[0m"; }
@@ -176,12 +178,12 @@ fi
 # 5b. ADM1600 inventory + association shim (glue so bmcweb sees the sensors)
 # ---------------------------------------------------------------------------
 if want assoc; then
-	log "adm1600-assoc (inventory + association shim)"
+	log "bmc-assoc (generic config-driven inventory + association shim)"
 	[ -r "$SHIM_SRC" ] || { echo "ERROR: shim source not found: $SHIM_SRC" >&2; exit 1; }
-	g++ -std=c++23 -O2 "$SHIM_SRC" -o /tmp/adm1600-assoc \
+	g++ -std=c++23 -O2 "$SHIM_SRC" -o /tmp/bmc-assoc \
 		$(pkg-config --cflags --libs sdbusplus)
-	install -Dm755 /tmp/adm1600-assoc "$STAGE/usr/bin/adm1600-assoc"
-	install -Dm755 /tmp/adm1600-assoc "$PREFIX/bin/adm1600-assoc"
+	install -Dm755 /tmp/bmc-assoc "$STAGE/usr/bin/bmc-assoc"
+	install -Dm755 /tmp/bmc-assoc "$PREFIX/bin/bmc-assoc"
 fi
 
 # ---------------------------------------------------------------------------
@@ -209,7 +211,7 @@ if [ "$RUN_TARBALL" = 1 ]; then
 	# Strip ELF binaries/libs (ignore scripts/failures).
 	find "$STAGE" -type f \( -name '*.so' -o -name '*.so.*' \) \
 		-exec strip --strip-unneeded {} + 2>/dev/null || true
-	for b in mapperx phosphor-hwmon-readd bmcweb adm1600-assoc adm1600-usermgr \
+	for b in mapperx phosphor-hwmon-readd bmcweb bmc-assoc adm1600-usermgr \
 		mapper phosphor-log-manager; do
 		strip --strip-unneeded "$(find "$STAGE" -type f -name "$b" | head -1)" 2>/dev/null || true
 	done

@@ -89,9 +89,15 @@ install -Dm755 "${FILES}/obmc-hwmon-adm1600-setup.sh" \
 	"${BUILD_DIR}/usr/bin/obmc-hwmon-adm1600-setup.sh"
 install -Dm644 "${FILES}/obmc-hwmon-adm1600.service" \
 	"${BUILD_DIR}/usr/lib/systemd/system/obmc-hwmon-adm1600.service"
-# inventory + sensor association shim (makes bmcweb expose the sensors)
-install -Dm644 "${FILES}/adm1600-assoc.service" \
-	"${BUILD_DIR}/usr/lib/systemd/system/adm1600-assoc.service"
+# Generic config-driven inventory + association shim (makes bmcweb expose the
+# sensors). The bmc-assoc binary ships in the stack tarball; here we install its
+# systemd unit and the per-device config. Adding another hwmon device is a
+# drop-in: copy a new /etc/bmc-assoc/<device>.conf and `systemctl restart
+# bmc-assoc` — no recompile, no image rebuild.
+install -Dm644 "${FILES}/bmc-assoc.service" \
+	"${BUILD_DIR}/usr/lib/systemd/system/bmc-assoc.service"
+install -Dm644 "${FILES}/bmc-assoc-adm1600.conf" \
+	"${BUILD_DIR}/etc/bmc-assoc/adm1600.conf"
 # minimal User.Manager provider so bmcweb can complete web UI login (role lookup)
 install -Dm644 "${FILES}/adm1600-usermgr.service" \
 	"${BUILD_DIR}/usr/lib/systemd/system/adm1600-usermgr.service"
@@ -144,7 +150,7 @@ chroot "${BUILD_DIR}" ldconfig
 chroot "${BUILD_DIR}" systemctl enable \
 	xyz.openbmc_project.ObjectMapper.service \
 	obmc-hwmon-adm1600.service \
-	adm1600-assoc.service \
+	bmc-assoc.service \
 	adm1600-usermgr.service \
 	bmcweb.service \
 	bmcweb.socket

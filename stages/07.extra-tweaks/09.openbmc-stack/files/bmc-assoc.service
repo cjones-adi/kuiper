@@ -1,0 +1,19 @@
+[Unit]
+Description=BMC inventory + sensor associations for bmcweb/Redfish (config-driven)
+Documentation=file:/etc/bmc-assoc
+# The ObjectMapper must be up so it can synthesise the all_sensors/chassis
+# association endpoints from the Association.Definitions this service publishes.
+Requires=xyz.openbmc_project.ObjectMapper.service
+After=xyz.openbmc_project.ObjectMapper.service
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.BmcAssoc
+# Reads every /etc/bmc-assoc/*.conf and publishes one chassis + association set
+# per file. Add a device by dropping in a new .conf and:  systemctl restart bmc-assoc
+ExecStart=/usr/bin/bmc-assoc /etc/bmc-assoc
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

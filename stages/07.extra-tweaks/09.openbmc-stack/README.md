@@ -25,8 +25,9 @@ ADM1600 @ I2C 0x48
             └─ phosphor-objmgr / mapperx  (xyz.openbmc_project.ObjectMapper)
                  DISCOVERS every busname by walking org.freedesktop.DBus.Introspectable.Introspect,
                  then indexes objects under /xyz/openbmc_project/sensors
-                 └─ adm1600-assoc shim  (xyz.openbmc_project.adm1600.Inventory)
-                      publishes the chassis object + an `all_sensors` association
+                 └─ bmc-assoc shim  (xyz.openbmc_project.BmcAssoc)
+                      reads /etc/bmc-assoc/*.conf and publishes, per device, the
+                      chassis object + an `all_sensors` association
                       (chassis endpoint -> each sensor path)
                       └─ bmcweb  builds /redfish/v1/Chassis/adm1600/Sensors from the association
                            └─ webui-vue  renders the Chassis + Sensors pages
@@ -89,7 +90,7 @@ sudo busctl call xyz.openbmc_project.ObjectMapper \
 **Apply / re-apply the fix live (no rebuild):** edit
 `/usr/share/dbus-1/system.d/openbmc-adm1600.conf`, then
 `sudo systemctl reload dbus && sudo systemctl restart xyz.openbmc_project.ObjectMapper.service`
-and restart `adm1600-assoc.service bmcweb.service`.
+and restart `bmc-assoc.service bmcweb.service`.
 
 > Note on `send_destination_prefix`: this build uses **dbus-daemon 1.16.2** (not
 > dbus-broker). It *parses* `send_destination_prefix` fine (added in the 1.15.x
@@ -173,7 +174,7 @@ assume the append point is `[all]`.
 ### Packaging gotcha — the usermgr binary is NOT in the main tarball
 `adm1600-usermgr` was built **after** and **separately from**
 `openbmc-stack-arm64.tar.zst` (into `kuiper-volume/openbmc/usermgr-stage/`). The
-tarball only contains `adm1600-assoc`. Stage 09 therefore installs the usermgr
+tarball only contains `bmc-assoc`. Stage 09 therefore installs the usermgr
 binary from its stage dir explicitly; if that dir is empty the stage **fails
 fast** (rather than shipping an image whose login regresses to 500). Rebuild it
 with:
@@ -188,7 +189,7 @@ docker exec obmc-build bash -lc 'cd /work && \
 ## Known-normal cosmetics (not bugs)
 
 - **Chassis fields mostly `--`** (Part/Serial/Model/Manufacturer/Asset tag,
-  Power/Min/Max, Health icon). The `adm1600-assoc` shim publishes only the minimum
+  Power/Min/Max, Health icon). The `bmc-assoc` shim publishes only the minimum
   (`Item.Board`/`Item.Chassis` + `ChassisType=RackMount` + the `all_sensors`
   association). To populate them, add `Decorator.Asset` / `Decorator.Revision` /
   `OperationalStatus` interfaces to the shim. Optional polish.
@@ -201,7 +202,7 @@ docker exec obmc-build bash -lc 'cd /work && \
 ## Sanity checklist after a clean image build
 
 1. `i2cdetect -y 1` shows `48`
-2. `systemctl is-active xyz.openbmc_project.ObjectMapper obmc-hwmon-adm1600 adm1600-assoc adm1600-usermgr bmcweb` → all active
+2. `systemctl is-active xyz.openbmc_project.ObjectMapper obmc-hwmon-adm1600 bmc-assoc adm1600-usermgr bmcweb` → all active
 3. `curl -sk https://localhost/redfish/v1/Chassis/adm1600/Sensors` → 3 Members
 4. Web UI login as **`analog` / `analog`** succeeds (admin); Chassis + Sensors render.
    If login is rejected, confirm the group: `getent group redfish` should list `analog`.

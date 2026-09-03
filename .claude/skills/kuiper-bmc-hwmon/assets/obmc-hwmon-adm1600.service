@@ -1,0 +1,15 @@
+[Unit]
+Description=Configure and start phosphor-hwmon for the ADM1600
+After=xyz.openbmc_project.ObjectMapper.service
+Wants=xyz.openbmc_project.ObjectMapper.service
+ConditionPathExists=/sys/class/hwmon
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Retry a few times: the i2c/adm1600 hwmon may appear slightly after boot.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do grep -qx adm1600 /sys/class/hwmon/hwmon*/name 2>/dev/null && exit 0; sleep 1; done; exit 0'
+ExecStart=/usr/bin/obmc-hwmon-adm1600-setup.sh
+
+[Install]
+WantedBy=multi-user.target

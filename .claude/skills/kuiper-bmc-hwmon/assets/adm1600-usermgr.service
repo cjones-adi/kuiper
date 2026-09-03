@@ -1,0 +1,15 @@
+[Unit]
+Description=Minimal User.Manager provider for bmcweb login (role lookup only)
+# Only the system bus is needed; bmcweb calls GetUserInfo on this name at login.
+Requires=dbus.service
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.User.Manager
+ExecStart=/usr/bin/adm1600-usermgr
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

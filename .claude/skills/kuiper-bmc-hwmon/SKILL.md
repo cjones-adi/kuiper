@@ -247,6 +247,14 @@ restart ObjectMapper + bmc-assoc + bmcweb.
 
 ## Adapting for a new device — checklist
 
+> **Automate the per-device files:** `scripts/gen-device-dropins.sh --name <device>
+> --addr 0xNN --channel in1=Vin --channel curr1=Iin ...` emits all of the files
+> below (both confs, the instantiator + service, the `config.txt` block, plus a
+> `deploy.sh` and a curl-only `validate.sh`) — deterministically, matching the
+> validated ADM1600 shapes. The `kuiper-bmc-integrate` agent wraps this end to end
+> (generate → validate over Redfish → diagnose empty Sensors). Hand-editing per the
+> checklist still works if you prefer.
+
 - [ ] Kernel driver present; hwmon `name` = `<device>`; overlay + i2c modules (Step 1).
 - [ ] `<device>-hwmon.conf`: `HW_SENSOR_ID` + `LABEL_*` for real channels.
 - [ ] `obmc-hwmon-<device>-setup.sh`/`.service`: rename, match the `name` grep.
@@ -256,6 +264,11 @@ restart ObjectMapper + bmc-assoc + bmcweb.
 
 ## Assets & references
 
+- `scripts/gen-device-dropins.sh` — deterministic Phase-1 generator: turns a device
+  spec (`--name`/`--addr`/`--channel`) into the full per-device drop-in package
+  (`<device>-hwmon.conf`, `obmc-hwmon-<device>-setup.sh` + `.service`,
+  `<device>.conf` bmc-assoc drop-in, `config.txt.snippet`, `<device>-i2c.conf`,
+  `deploy.sh`, `validate.sh`, `README.txt`). No hardware, no image rebuild.
 - `assets/` — the actual working glue files (templates to copy/rename):
   `bmc-assoc.cpp`, `bmc-assoc.service`, `bmc-assoc-adm1600.conf`,
   `adm1600-hwmon.conf`, `obmc-hwmon-adm1600-setup.sh`,

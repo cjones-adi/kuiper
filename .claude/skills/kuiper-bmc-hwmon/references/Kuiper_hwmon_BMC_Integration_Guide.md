@@ -1,12 +1,72 @@
 # Adding a hwmon Device to the BMC Framework on Kuiper OS
 
-> **Date:** September 1, 2026\
+> **Date:** September 3, 2026\
 > **Applies to:** ADI Kuiper Linux (Debian Trixie, arm64) on Raspberry Pi 4\
 > **Purpose:** Expose any Linux **hwmon** device (voltage/current/power/temp/fan)
 > in Redfish and the OpenBMC web UI, using the real OpenBMC daemons running
 > **natively on Kuiper** — not a Yocto `obmc-phosphor-image`.\
 > **Worked example:** ADM1600 hot-swap controller (I2C `0x48`). Everything marked
 > `<device>` / `<addr>` / `<label>` is what you change for a different part.
+
+---
+
+## Who this is for: two users, one framework
+
+This integration is built around **two distinct roles**. Keeping them separate is
+the key to understanding *what lives where* — and why most of the work is
+**one-time** rather than per-device.
+
+| | **Platform / driver developer** | **End-user (device buyer)** |
+|---|---|---|
+| Owns | the kernel side + the device package | the running system |
+| Produces | builtin **driver**, **`.dtbo`**, `config.txt` lines, a small **drop-in package** | nothing — *consumes* the above |
+| Ships to the other | kernel image + `.dtbo` + drop-in files + a short "apply this" note | — |
+| Does | writes/validates the driver once | downloads the stock **Kuiper image with BMC-framework support**, applies the developer's package, reboots |
+| Gets in return | — | Redfish + a web UI for the device, **instead of** a bespoke `pyadi-iio` script or custom page |
+
+The thing that makes this tractable: **the BMC framework itself is
+device-agnostic and shipped once, inside the Kuiper image.** Adding a device does
+**not** rebuild the framework — it drops a few text files onto a running system.
+
+### What the framework gives you (baked into the image, built once)
+
+These are compiled/configured a single time by the platform team and never mention
+any specific device:
+
+- `bmcweb` — the Redfish + web server
+- `phosphor-objmgr` / mapperx — the D-Bus object index
+- `phosphor-hwmon` — the sysfs→D-Bus sensor poller (template unit + `readd`)
+- **`bmc-assoc`** — the **generic, config-driven** inventory/association shim
+  (reads `/etc/bmc-assoc/*.conf` at startup — see Step 3)
+- the **open D-Bus policy** (Debian ships a closed bus; the framework opens it)
+- the **login stack** — PAM `webserver` policy, a `User.Manager` shim, the
+  `redfish` group
+
+### What the developer ships per device (the drop-in package)
+
+Small, device-specific, **copied onto a stock framework image** — no image rebuild:
+
+1. **Kernel image** (driver builtin) **+ `.dtbo`** + the `config.txt` lines.
+2. **hwmon labeling** — a `<device>-hwmon.conf` plus a tiny instantiator (Step 2).
+3. **Association drop-in** — one `/etc/bmc-assoc/<device>.conf` (Step 3).
+
+### Kernel space vs. user space — and how it maps onto the two users
+
+> **Kernel space makes the device *appear* as hwmon; user space turns that hwmon
+> node into a Redfish sensor.** That boundary is exactly the developer/end-user
+> boundary.
+
+- **Kernel space (developer's builtin driver + `.dtbo`)** binds the part and
+  exposes `/sys/class/hwmon/hwmonN/{in1,curr1,power1,…}_input`. This is the
+  developer's domain and is delivered as a kernel image + overlay.
+- **User space (the framework + the drop-in confs)** reads those sysfs files and
+  publishes them on D-Bus, indexes them, associates them to a chassis, and serves
+  them over Redfish. The device-agnostic half is baked into the image; the
+  per-device half is the developer's drop-in package.
+
+So "device configuration for the BMC framework" is **user-space configuration** —
+text files consumed by daemons already present in the image — layered on top of a
+**kernel-space** driver the developer supplies.
 
 ---
 
@@ -23,24 +83,24 @@ builder**, and we run the *same* OpenBMC daemons on top of Debian.
 | Build system | BitBake recipes, `local.conf` | pi-gen **stages** (`stages/**/run.sh`) |
 | Getting the daemons | compiled by the image | **prebuilt arm64 tarball** extracted by a stage |
 | I2C enable | `ENABLE_I2C = "1"` | `config.txt` (`dtparam=i2c_arm=on` + overlay) |
-| Sensor→chassis link | entity-manager auto-discovery | **hand-written association shim** (no entity-manager) |
+| Sensor→chassis link | entity-manager auto-discovery | **config-driven `bmc-assoc` shim** (no entity-manager) |
 | D-Bus bus policy | wide-open intra-service bus (shipped) | **Debian closes it — you must open it** |
 | Web UI login | phosphor-user-manager + PAM | **usermgr shim + `redfish` group + PAM** |
 | Deploy | flash `.wic` | `build-docker.sh` → flash `.img` |
 
 The single most important consequence: **on Debian you must recreate three things
 that a real OpenBMC image gives you for free** — the sensor↔chassis association,
-an open D-Bus policy, and a `User.Manager` for login. The rest is standard
-phosphor-hwmon.
+an open D-Bus policy, and a `User.Manager` for login. All three are in the
+framework image; the rest is standard phosphor-hwmon.
 
 ---
 
 ## The discovery chain (how a sysfs value becomes a Redfish sensor)
 
 ```
-<device> @ I2C <addr>
+<device> @ I2C <addr>                                    [ kernel space — developer ]
   └─ kernel driver -> /sys/class/hwmon/hwmonN/{in1,curr1,power1,tempN,...}_input
-       └─ phosphor-hwmon-readd   (unit: xyz.openbmc_project.Hwmon@<OF-path>.service)
+       └─ phosphor-hwmon-readd   (unit: xyz.openbmc_project.Hwmon@<OF-path>.service)   [ user space — framework + drop-in ]
             owns busname  xyz.openbmc_project.Hwmon-<id>.Hwmon<N>
             publishes     /xyz/openbmc_project/sensors/{voltage,current,power}/<label>
                           each implementing xyz.openbmc_project.Sensor.Value
@@ -48,26 +108,32 @@ phosphor-hwmon.
                  DISCOVERS every busname by walking
                  org.freedesktop.DBus.Introspectable.Introspect,
                  then indexes objects under /xyz/openbmc_project/sensors
-                 └─ <device>-assoc shim   (publishes chassis + `all_sensors` assoc)
-                      chassis object + Association.Definitions(all_sensors -> sensors)
+                 └─ bmc-assoc   (xyz.openbmc_project.BmcAssoc)
+                      reads /etc/bmc-assoc/*.conf and publishes, per file,
+                      a chassis object + `all_sensors` association -> the sensors
                       └─ bmcweb   builds /redfish/v1/Chassis/<device>/Sensors
                            └─ webui-vue   renders the Chassis + Sensors pages
 ```
 
 **Every link must succeed.** If one is broken the collection silently returns
 `Sensors: []` — the UI shows the chassis but no sensors. The two links that do
-**not** exist by default on Debian are the **assoc shim** and (implicitly) the
-**open D-Bus policy** that lets the mapper complete its discovery walk.
+**not** exist by default on Debian are the **association** (now provided by the
+generic `bmc-assoc` reading your drop-in conf) and the **open D-Bus policy** that
+lets the mapper complete its discovery walk. Both are in the framework image.
 
 ---
 
-## Prerequisites
+## Building the framework image (platform team — one-time)
 
-### 1. The prebuilt OpenBMC stack (device-agnostic — build once)
+*Skip this whole section if you already have a Kuiper image with BMC-framework
+support — as an end-user adding a device, you do.* This is how the reusable,
+device-agnostic image is produced.
 
-The daemons (`bmcweb`, `phosphor-objmgr`, `phosphor-hwmon`) are compiled once for
-arm64/Trixie and packaged into a tarball that a Kuiper stage extracts. This stack
-is **not per-device** — you build it once and reuse it for every hwmon device.
+### The prebuilt OpenBMC stack (device-agnostic)
+
+The daemons (`bmcweb`, `phosphor-objmgr`, `phosphor-hwmon`) **and the generic
+`bmc-assoc` shim** are compiled once for arm64/Trixie and packaged into a tarball
+that a Kuiper stage extracts. This stack is **not per-device**.
 
 ```bash
 # On the host, in a persistent arm64 build container (see ~/kuiper/build-openbmc-arm64.sh):
@@ -78,41 +144,44 @@ docker exec obmc-build bash -lc 'cd /work && RUN_TARBALL=1 bash build-openbmc-ar
 > `kuiper-volume/` is bind-mounted at `/kuiper-volume` inside the Kuiper build
 > container and is **gitignored** (it holds large artifacts). The stage fails
 > fast if the tarball is missing.
+>
+> **`qemu-aarch64` binfmt does not survive a WSL2/Docker restart.** If a build
+> exec dies with "Exec format error", re-register it with
+> `docker run --rm --privileged multiarch/qemu-user-static --reset -p yes`.
+> `build-docker.sh` verifies this for the image build; the standalone
+> `docker exec` above does not.
 
-### 2. A kernel with your driver + I2C
+The framework stage (`stages/07.extra-tweaks/09.openbmc-stack`) installs the
+device-agnostic pieces: the stack, the generic `bmc-assoc` **binary + service**,
+the **open D-Bus policy** (Step 4), and the **login stack** (Step 5). It enables
+them so on boot: `dbus → ObjectMapper → hwmon poller → bmc-assoc → bmcweb(:443)`.
 
-Your device's hwmon driver must be present in the Kuiper kernel and the I2C bus
-must be enabled at boot. For the ADM1600 this is handled by stage
-`06.boot-partition/03.adm1600-kernel` (see Step 1).
-
----
-
-## What you add per device (five pieces)
-
-For each new hwmon device you add **glue**, not daemons:
-
-1. **Kernel/boot** — driver bound + I2C bus up + device-tree overlay (stage 06).
-2. **phosphor-hwmon config + instantiator** — label the channels and start the
-   poller for your device's runtime OF path (stage 09).
-3. **Association shim** — publish a chassis object + `all_sensors` association so
-   bmcweb has a `Chassis/<device>/Sensors` to populate (stage 09).
-4. **D-Bus policy** — one shared open policy so the mapper can discover objects
-   (stage 09; shared across all devices — you usually don't touch it again).
-5. **(Optional) Web UI login** — PAM + `redfish` group + usermgr shim (stage 09;
-   also shared — set up once).
-
-Pieces 4 and 5 are **one-time, shared** setup. Pieces 1–3 are per-device.
+> **Bench note:** for the single-device bench, this same stage also bakes in the
+> ADM1600 *example* drop-in files (its hwmon conf, instantiator, and
+> `bmc-assoc-adm1600.conf`). On a truly device-agnostic image those would be
+> omitted, and the ADM1600 files delivered as the developer's package below. The
+> mechanism is identical either way — the only question is whether the files are
+> pre-copied or dropped in at runtime.
 
 ---
 
-## Step 1 — Kernel, I2C, and device tree (stage 06)
+## Adding your device (developer package + end-user drop-in)
+
+Everything below is the **per-device** work. On a stock framework image these are
+files you **drop in at runtime** — no rebuild. Pieces 4–5 (D-Bus policy, login)
+are already in the image and are **not** repeated per device.
+
+### Step 1 — Kernel, I2C, and device tree
 
 Reference: `stages/06.boot-partition/03.adm1600-kernel/run.sh`.
 
-### 1a. Enable I2C and load your overlay in `config.txt`
+The **developer** delivers a kernel image with the driver builtin, a `.dtbo`, and
+the `config.txt` lines. The **end-user** installs them and reboots.
+
+#### 1a. Enable I2C and load the overlay in `config.txt`
 
 ```bash
-CFG="${BUILD_DIR}/boot/config.txt"
+CFG=/boot/config.txt        # (image build: "${BUILD_DIR}/boot/config.txt")
 sed -i '/^kernel=/d;/^dtoverlay=<device>/d;/^dtparam=i2c_arm=/d' "${CFG}"
 cat >> "${CFG}" <<'EOF'
 
@@ -133,33 +202,39 @@ EOF
 > inside `[cm5]`, appending your overlay without `[all]` first makes it apply only
 > to a CM5 — on a Pi4 it's ignored with nothing in the logs.
 
-### 1b. Autoload the I2C modules + install i2c-tools
+#### 1b. Autoload the I2C modules + install i2c-tools
 
 `i2c-dev` and `i2c-bcm2835` are built as modules and `i2c-dev` is never
 autoloaded, so nothing opens `/dev/i2c-*` without this:
 
 ```bash
-install -Dm644 /dev/stdin "${BUILD_DIR}/etc/modules-load.d/<device>-i2c.conf" <<'EOF'
+install -Dm644 /dev/stdin /etc/modules-load.d/<device>-i2c.conf <<'EOF'
 i2c-bcm2835
 i2c-dev
 EOF
-chroot "${BUILD_DIR}" depmod "${KREL}"
-chroot "${BUILD_DIR}" apt-get install -y --no-install-recommends i2c-tools
+depmod "$(uname -r)"          # image build: chroot ... depmod "${KREL}"
+apt-get install -y --no-install-recommends i2c-tools
 ```
 
----
-
-## Step 2 — phosphor-hwmon config + runtime instantiator (stage 09)
+### Step 2 — phosphor-hwmon config + instantiator (per-device drop-in)
 
 phosphor-hwmon's unit is a **template**, `xyz.openbmc_project.Hwmon@%I.service`,
-where `%I` is the device's **device-tree (OF) path** — which is only known on the
-booted Pi. So we ship a config **template** plus a **first-boot script** that
-discovers the instance and drops the config at the `%I`-derived path.
+where `%I` is the device's **device-tree (OF) path** — only known on the booted
+Pi. So the developer ships a config **template** plus a **first-boot script** that
+discovers the instance and drops the config at the `%I`-derived path. These are
+part of the drop-in package.
 
-### 2a. The config template
+> **Scope note:** unlike the association (Step 3, one generic reader), the hwmon
+> instantiator is still **per-device** today — the script greps for your `name`
+> and points at your template. Generalizing it into a single config-driven reader
+> (à la `bmc-assoc`) is the natural next step; until then, ship these two small
+> files with the package.
 
-`files/<device>-hwmon.conf` — label only the **standard** hwmon channels your
-driver exposes (`inN_`, `currN_`, `powerN_`, `tempN_`, `fanN_`):
+#### 2a. The config template
+
+`<device>-hwmon.conf` — label only the **standard** hwmon channels your driver
+exposes (`inN_`, `currN_`, `powerN_`, `tempN_`, `fanN_`). On the running system it
+is consumed at `/usr/share/<device>/<device>-hwmon.conf`:
 
 ```ini
 # D-Bus busname suffix: xyz.openbmc_project.Hwmon-<device>.Hwmon1
@@ -183,11 +258,11 @@ LABEL_power1=<device>_Pin
 > non-standard encodings (e.g. ADM1600's IEEE-754 `pid*`, `duty_cycle`) are **not
 > hwmon sensors** and need a separate custom D-Bus service — out of scope here.
 
-### 2b. The first-boot instantiator
+#### 2b. The first-boot instantiator
 
-`files/obmc-hwmon-<device>-setup.sh` finds the hwmon node by `name`, derives its
-OF path, reproduces phosphor-hwmon's `start_hwmon.sh` escaping so the config
-filename matches `%I`, installs the config, and starts the poller. Idempotent:
+`obmc-hwmon-<device>-setup.sh` finds the hwmon node by `name`, derives its OF
+path, reproduces phosphor-hwmon's `start_hwmon.sh` escaping so the config filename
+matches `%I`, installs the config, and starts the poller. Idempotent:
 
 ```bash
 #!/bin/bash
@@ -222,10 +297,10 @@ install -d "$(dirname "$conf")"; install -m644 "$TEMPLATE" "$conf"
 systemctl start "xyz.openbmc_project.Hwmon@${esc}.service"
 ```
 
-### 2c. The oneshot service that runs it
+#### 2c. The oneshot service that runs it
 
-`files/obmc-hwmon-<device>.service` — waits for the hwmon node to appear (the
-I2C device may enumerate slightly after boot), then runs the setup script:
+`obmc-hwmon-<device>.service` — waits for the hwmon node to appear (the I2C device
+may enumerate slightly after boot), then runs the setup script:
 
 ```ini
 [Unit]
@@ -244,9 +319,7 @@ ExecStart=/usr/bin/obmc-hwmon-<device>-setup.sh
 WantedBy=multi-user.target
 ```
 
----
-
-## Step 3 — The association / inventory shim (stage 09)
+### Step 3 — The association: a drop-in `.conf` (no recompile)
 
 **This is the piece a real OpenBMC image gives you via entity-manager, and the
 usual reason `Sensors` is empty.** phosphor-hwmon publishes `Sensor.Value`
@@ -254,69 +327,70 @@ objects, but bmcweb builds `Chassis/<device>/Sensors` from an **association**
 (`all_sensors`) hanging off a **chassis inventory object**. No chassis + no
 association ⇒ empty collection.
 
-Write a tiny sdbusplus service (`files/<device>-assoc.cpp`) that publishes one
-inventory object plus the association. The sensor paths must match your
-`LABEL_*` exactly:
+**You no longer write or compile any C++ for this.** The framework image ships a
+single generic daemon, **`bmc-assoc`** (busname `xyz.openbmc_project.BmcAssoc`),
+that reads **every** `/etc/bmc-assoc/*.conf` at startup and publishes, per file,
+one chassis object plus its `all_sensors` association. Adding a device is a
+**drop-in**: write one small conf and restart the service.
 
-```cpp
-constexpr const char* busName = "xyz.openbmc_project.<device>.Inventory";
-const std::string chassisPath =
-    "/xyz/openbmc_project/inventory/system/chassis/<device>";
-constexpr const char* sensorRoot = "/xyz/openbmc_project/sensors";
+#### 3a. Write the device conf
 
-// (forward, reverse, endpoint): chassis --all_sensors--> each sensor path.
-// phosphor-objmgr synthesises the reverse (<sensor>/chassis) automatically.
-const std::vector<Association> associations = {
-    {"all_sensors", "chassis", std::string(sensorRoot) + "/voltage/<device>_Vin"},
-    {"all_sensors", "chassis", std::string(sensorRoot) + "/current/<device>_Iin"},
-    {"all_sensors", "chassis", std::string(sensorRoot) + "/power/<device>_Pin"},
-};
-// ... request_name, then:
-server.add_manager("/xyz/openbmc_project/inventory");   // emit InterfacesAdded
-// chassisPath implements: Inventory.Item (Name, Present),
-//                         Inventory.Item.Board (matches bmcweb chassisInterfaces),
-//                         Association.Definitions (Associations = a(sss))
-```
-
-Its unit (`files/<device>-assoc.service`) must start **after** the ObjectMapper:
+`/etc/bmc-assoc/<device>.conf` — the `SENSOR` paths must match your `LABEL_*`
+exactly (`<type>/<label>`, relative to `/xyz/openbmc_project/sensors`):
 
 ```ini
-[Unit]
-Requires=xyz.openbmc_project.ObjectMapper.service
-After=xyz.openbmc_project.ObjectMapper.service
-Wants=obmc-hwmon-<device>.service
-After=obmc-hwmon-<device>.service
-[Service]
-Type=dbus
-BusName=xyz.openbmc_project.<device>.Inventory
-ExecStart=/usr/bin/<device>-assoc
-Restart=always
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
+CHASSIS=<device>
+NAME=<device>
+SENSOR=voltage/<device>_Vin
+SENSOR=current/<device>_Iin
+SENSOR=power/<device>_Pin
 ```
 
+| Key | Meaning |
+|---|---|
+| `CHASSIS` | **required** — becomes `/redfish/v1/Chassis/<CHASSIS>` |
+| `NAME` | optional display name (defaults to `CHASSIS`) |
+| `SENSOR` | **repeatable** — a sensor subpath (or an absolute D-Bus path) |
+| `SENSOR_ROOT` | optional — override the default `/xyz/openbmc_project/sensors` |
+
+`LABEL_` → sensor **type** mapping (hwmon channel → D-Bus subtree): `in` →
+`voltage`, `curr` → `current`, `power` → `power`, `temp` → `temperature`, `fan` →
+`fan_tach`.
+
+#### 3b. Apply it (this is the whole "recompile" — a service restart)
+
+```bash
+sudo cp <device>.conf /etc/bmc-assoc/<device>.conf
+sudo systemctl restart bmc-assoc
+curl -sk https://localhost/redfish/v1/Chassis            # -> now lists <device>
+curl -sk https://localhost/redfish/v1/Chassis/<device>/Sensors   # -> your sensors
+```
+
+That's the payoff of the config-driven model: **a new device needs a text file
+and a service restart — no arm64 recompile, no tarball repack, no image reflash.**
+A malformed conf is skipped (not fatal), so one bad file can't take down the
+others.
+
 > **Self-healing gotcha:** phosphor-objmgr **defers** an association until its
-> endpoint object exists on D-Bus. If the shim starts before the sensors are
+> endpoint object exists on D-Bus. If `bmc-assoc` starts before the sensors are
 > published, the association is created **later**, automatically, once
-> phosphor-hwmon publishes them. That's expected — don't "fix" it with ordering
-> hacks beyond the `Wants=`/`After=` above.
+> phosphor-hwmon publishes them. The chassis appears immediately; its
+> `all_sensors` resolves once the hwmon poller is up. That's expected — don't
+> "fix" it with ordering hacks.
 
 > The chassis object publishes only the **minimum** interfaces, so the web UI's
 > Chassis card shows `--` for Part/Serial/Model/etc. That's **cosmetic**
 > (see [Known-normal cosmetics](#known-normal-cosmetics)).
 
----
+### Step 4 — Open the D-Bus policy (in the framework image — reference only)
 
-## Step 4 — Open the D-Bus policy (shared, one-time)
+*Already in the image; you do not repeat this per device. Included so you
+understand the chain and can live-patch a bench.*
 
 **The subtle, expensive gotcha.** Debian's `/usr/share/dbus-1/system.conf` ships
 a **closed** system bus (`<deny send_type="method_call"/>` in the default
 policy); services are expected to punch holes. Real OpenBMC ships a **wide-open**
-intra-service bus. On Kuiper you must recreate that.
-
-Install `files/openbmc-<device>-dbus.conf` (shared across all your OpenBMC
-services — you write it once) to
+intra-service bus. The framework recreates that in
 `/usr/share/dbus-1/system.d/openbmc-<device>.conf`:
 
 ```xml
@@ -349,9 +423,9 @@ covers the discovery walk.
 > this. This is a dev bench with bmcweb auth disabled, so the open bus is
 > acceptable. (Env here: `dbus-daemon 1.16.2`, not dbus-broker.)
 
----
+### Step 5 — Web UI login (in the framework image — reference only)
 
-## Step 5 — Web UI login (shared, one-time)
+*Already in the image; set up once, shared by all devices.*
 
 Redfish is served **auth-disabled** on this bench
 (`-Dinsecure-disable-auth=enabled`), so `curl` needs no credentials. The
@@ -371,38 +445,46 @@ doesn't provide:
 2. **A `User.Manager` provider.** After PAM succeeds, bmcweb calls
    `xyz.openbmc_project.User.Manager.GetUserInfo` for the Redfish role. Real
    OpenBMC runs phosphor-user-manager; we don't, so a **usermgr shim**
-   (`files/<device>-usermgr.cpp`, owning only that name) answers it from the
-   user's **Unix groups** (`redfish`/`sudo`/`priv-admin` → `priv-admin`, else
-   `priv-user`). Without it, valid logins return **HTTP 500**.
+   (owning only that name) answers it from the user's **Unix groups**
+   (`redfish`/`sudo`/`priv-admin` → `priv-admin`, else `priv-user`). Without it,
+   valid logins return **HTTP 500**.
 
-3. **Create the `redfish` group** and add the default user (the base Kuiper build
-   never creates it):
+3. **The `redfish` group** exists and the default user is a member (the base
+   Kuiper build never creates it):
 
    ```bash
-   chroot "${BUILD_DIR}" /bin/bash -e <<'EOF'
    groupadd -f redfish
    id analog >/dev/null 2>&1 && usermod -aG redfish analog
-   EOF
    ```
 
 > **There is no bmcweb password.** Login uses a **real Unix account** — on Kuiper
 > the default is **`analog` / `analog`** (root is `root` / `analog`). Add more
 > operators with `sudo usermod -aG redfish <user>`.
 
-> **Packaging trap:** the usermgr binary is built **separately** from the main
-> stack tarball (into `kuiper-volume/openbmc/usermgr-stage/`), so stage 09 installs
-> it explicitly and **fails fast** if missing — otherwise a clean image enables
-> the service with no binary and login regresses to 500.
+> **Packaging trap (framework build):** the usermgr binary is built **separately**
+> from the main stack tarball (into `kuiper-volume/openbmc/usermgr-stage/`), so the
+> stage installs it explicitly and **fails fast** if missing — otherwise a clean
+> image enables the service with no binary and login regresses to 500.
 
----
+### Step 6 — Enable the per-device services
 
-## Step 6 — Enable the services (stage 09)
+The framework services (`ObjectMapper`, `bmc-assoc`, `bmcweb`, usermgr) are
+already enabled in the image. Per device you only add the **hwmon instantiator**;
+`bmc-assoc` just needs a restart to pick up your new conf:
+
+```bash
+# runtime drop-in on a stock image:
+sudo systemctl enable --now obmc-hwmon-<device>.service
+sudo systemctl restart bmc-assoc.service
+```
+
+At image-build time the stage enables the full set once:
 
 ```bash
 chroot "${BUILD_DIR}" systemctl enable \
 	xyz.openbmc_project.ObjectMapper.service \
 	obmc-hwmon-<device>.service \
-	<device>-assoc.service \
+	bmc-assoc.service \
 	<device>-usermgr.service \
 	bmcweb.service \
 	bmcweb.socket
@@ -415,7 +497,40 @@ chroot "${BUILD_DIR}" systemctl enable \
 
 ---
 
-## Build and deploy
+## The end-user drop-in, end to end (no rebuild)
+
+Given a stock **Kuiper image with BMC-framework support** and the developer's
+package, the end-user's entire procedure is:
+
+```bash
+# 1. Kernel side (developer's kernel image + .dtbo + config.txt note) -> reboot
+sudo cp <device>.dtbo /boot/overlays/
+#    ...apply the developer's config.txt lines (Step 1a), then:  sudo reboot
+
+# 2. hwmon labeling (from the package)
+sudo install -Dm644 <device>-hwmon.conf        /usr/share/<device>/<device>-hwmon.conf
+sudo install -Dm755 obmc-hwmon-<device>-setup.sh /usr/bin/obmc-hwmon-<device>-setup.sh
+sudo install -Dm644 obmc-hwmon-<device>.service  /usr/lib/systemd/system/obmc-hwmon-<device>.service
+
+# 3. Association drop-in (from the package)
+sudo install -Dm644 <device>.conf              /etc/bmc-assoc/<device>.conf
+
+# 4. Start it
+sudo systemctl daemon-reload
+sudo systemctl enable --now obmc-hwmon-<device>.service
+sudo systemctl restart bmc-assoc.service
+
+# 5. Verify
+curl -sk https://localhost/redfish/v1/Chassis/<device>/Sensors | jq '.Members'
+#    ...and browse https://<pi>  (login analog / analog)
+```
+
+No `build-docker.sh`, no reflash. The framework was built once; the device is
+just files.
+
+---
+
+## Build and deploy the framework image (platform team)
 
 ```bash
 cd ~/kuiper
@@ -446,7 +561,7 @@ cat "$HW"/in1_input "$HW"/curr1_input "$HW"/power1_input   # mV / mA / µW
 
 # 3. Services all active
 systemctl is-active xyz.openbmc_project.ObjectMapper \
-  obmc-hwmon-<device> <device>-assoc <device>-usermgr bmcweb
+  obmc-hwmon-<device> bmc-assoc <device>-usermgr bmcweb
 
 # 4. phosphor-hwmon publishes the sensors (works even under a broken bus policy)
 sudo busctl call xyz.openbmc_project.Hwmon-<device>.Hwmon1 \
@@ -463,6 +578,18 @@ curl -sk https://localhost/redfish/v1/Chassis/<device>/Sensors | jq '.Members'
 # 7. Web UI: browse https://<pi>  and log in with  analog / analog
 ```
 
+**Prove the drop-in model** (what the config-driven `bmc-assoc` buys you): add a
+throwaway chassis with only a file + restart, then remove it.
+
+```bash
+printf 'CHASSIS=testdev\nNAME=testdev\nSENSOR=voltage/<device>_Vin\n' \
+  | sudo tee /etc/bmc-assoc/test.conf >/dev/null
+sudo systemctl restart bmc-assoc
+curl -sk https://localhost/redfish/v1/Chassis            # -> lists <device> AND testdev
+sudo rm /etc/bmc-assoc/test.conf && sudo systemctl restart bmc-assoc
+curl -sk https://localhost/redfish/v1/Chassis            # -> back to just <device>
+```
+
 ---
 
 ## Troubleshooting
@@ -472,7 +599,8 @@ curl -sk https://localhost/redfish/v1/Chassis/<device>/Sensors | jq '.Members'
 | No `/dev/i2c-1`, no `<device>` in `/sys/class/hwmon` | overlay inherited the base file's trailing `[cm5]` filter | add `[all]` before the overlay lines (Step 1a) |
 | `i2cdetect` missing / bus absent | `i2c-dev`/`i2c-bcm2835` not autoloaded | `modules-load.d` + `depmod` (Step 1b) |
 | Sensors in sysfs but **`Sensors: []`** in Redfish | mapper can't complete its unique-name `Introspect` walk | blanket `method_call` D-Bus policy (Step 4) |
-| Chassis shows, but no sensors, and mapper index (validation #5) is empty | missing association shim, or `LABEL_*` ≠ shim sensor paths | Step 3; make paths match exactly |
+| Chassis shows, but no sensors, and mapper index (validation #5) is empty | `bmc-assoc` conf missing, or `SENSOR=` paths ≠ `LABEL_*` sensor paths | Step 3; make paths match exactly, then `systemctl restart bmc-assoc` |
+| A device's chassis never appears | its `/etc/bmc-assoc/<device>.conf` is malformed (skipped) or `CHASSIS=` missing | check `journalctl -u bmc-assoc`; fix the conf, restart |
 | Web UI login → **HTTP 500** for valid creds | no `User.Manager` for the role lookup | usermgr shim built + installed (Step 5) |
 | Web UI login → **401**, PAM denies all | no `/etc/pam.d/webserver`, or user not in `redfish` | install PAM policy + `groupadd redfish` + `usermod -aG` (Step 5) |
 | bmcweb "not running" after boot | only `bmcweb.socket` enabled | enable `bmcweb.service` too (Step 6) |
@@ -493,16 +621,17 @@ sudo busctl introspect xyz.openbmc_project.Hwmon-<device>.Hwmon1 \
 `/usr/share/dbus-1/system.d/openbmc-<device>.conf` →
 `sudo systemctl reload dbus` →
 `sudo systemctl restart xyz.openbmc_project.ObjectMapper.service` →
-restart `<device>-assoc.service bmcweb.service`.
+restart `bmc-assoc.service bmcweb.service`.
 
 ---
 
 ## Known-normal cosmetics (not bugs)
 
 - **Chassis fields show `--`** (Part/Serial/Model/Manufacturer/Asset, Power
-  min/max, health icon). The assoc shim publishes only the minimum interfaces.
-  To populate them, add `Decorator.Asset` / `Decorator.Revision` /
-  `OperationalStatus` interfaces to the shim. Optional polish.
+  min/max, health icon). `bmc-assoc` publishes only the minimum interfaces.
+  To populate them, extend the shim with `Decorator.Asset` / `Decorator.Revision`
+  / `OperationalStatus` interfaces (and, ideally, matching conf keys). Optional
+  polish.
 - **Sensor values read `0`** while the sensors are visible and `Functional=true`.
   That's a **device/driver** concern (e.g. the part's lock state, a control loop
   not enabled, or no live power) — **not** a stack problem. Confirm against raw
@@ -512,7 +641,11 @@ restart `<device>-assoc.service bmcweb.service`.
 
 ## Adapting this guide for YOUR device — checklist
 
-Change these, everything else is reused:
+**Reused unchanged (in the framework image):** the prebuilt stack tarball, the
+generic `bmc-assoc` binary + service, the D-Bus policy (Step 4), and the login
+stack (Step 5). You never rebuild these to add a device.
+
+**Per device (the drop-in package):**
 
 - [ ] **Kernel driver** present and bound; hwmon `name` = `<device>`.
 - [ ] **Overlay** `dtoverlay=<device>` (and `<device>-i2c.conf`, `depmod`).
@@ -521,15 +654,15 @@ Change these, everything else is reused:
       labels (`LABEL_temp1`, `LABEL_fan1`) if present.
 - [ ] **`obmc-hwmon-<device>-setup.sh`** + **`.service`**: rename, match the
       `name` grep.
-- [ ] **`<device>-assoc.cpp`**: busname, chassis path, and the association
-      **endpoint paths must equal** `/xyz/openbmc_project/sensors/<type>/<label>`
-      for every `LABEL_*` above.
-- [ ] **Enable** the new `obmc-hwmon-<device>` + `<device>-assoc` units (Step 6).
-- [ ] **Reuse unchanged:** the prebuilt stack tarball, the D-Bus policy (Step 4),
-      and the login setup (Step 5) — these are shared across devices.
+- [ ] **`/etc/bmc-assoc/<device>.conf`**: `CHASSIS` + one `SENSOR=` per
+      `LABEL_*`, using `<type>/<label>` that **equals**
+      `/xyz/openbmc_project/sensors/<type>/<label>`. **No C++, no recompile.**
+- [ ] **Apply:** `systemctl enable --now obmc-hwmon-<device>` +
+      `systemctl restart bmc-assoc` (or enable both at image-build time).
 
-> Multiple devices: give each its own hwmon conf + assoc shim (distinct busname,
-> chassis path, and labels). The stack, D-Bus policy, and login are shared.
+> **Multiple devices:** each gets its own hwmon conf + instantiator and its own
+> `/etc/bmc-assoc/<device>.conf`. The stack, `bmc-assoc` binary, D-Bus policy, and
+> login are shared. `bmc-assoc` publishes one chassis per conf file.
 
 ---
 
@@ -538,6 +671,9 @@ Change these, everything else is reused:
 - **Kuiper stage (authoritative):** `~/kuiper/stages/07.extra-tweaks/09.openbmc-stack/`
   (`run.sh`, `files/`, and its `README.md` runbook).
 - **Kernel/boot stage:** `~/kuiper/stages/06.boot-partition/03.adm1600-kernel/run.sh`.
+- **Recreate-it-all skill:** `~/kuiper/.claude/skills/kuiper-bmc-hwmon/` — the
+  self-contained skill (SKILL.md + verbatim assets + references) an AI can follow
+  to rebuild this whole stack end-to-end.
 - **Architecture plan:** `Kuiper_Phosphor_Bmcweb_Architecture_Plan.md` (this dir).
 - **Yocto counterpart:** `docs/devices/adm1600/ADM1600_phosphor_hwmon_Guide.md`.
 - phosphor-hwmon: https://github.com/openbmc/phosphor-hwmon
@@ -546,6 +682,7 @@ Change these, everything else is reused:
 
 ---
 
-**Document Version:** 1.0\
-**Last Updated:** September 1, 2026\
-**Status:** Validated end-to-end on RPi4 (ADM1600, clean image build)
+**Document Version:** 2.0\
+**Last Updated:** September 3, 2026\
+**Status:** Validated end-to-end on RPi4 (ADM1600, clean image build); config-driven
+`bmc-assoc` drop-in verified live (chassis added/removed via a `.conf` + service restart)

@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+/*
+ * lm75-fan: "Hello World" thermal demo for OpenBMC-on-Kuiper (RPi4 / BCM2711)
+ *
+ *   LM75 (I2C 0x48)  --temp-->  Linux thermal zone  --cooling-->  PWM fan (GPIO18)
+ *
+ * Option K: the KERNEL runs the control loop (thermal step_wise governor).
+ * OpenBMC/phosphor-hwmon only OBSERVES temp + fan RPM over Redfish.
+ *
+ * Enabled by this stage's config.txt block:
+ *     [all]
+ *     dtoverlay=pwm,pin=18,func=2      # GPIO18 = PWM0 (ALT5), driven at 25kHz
+ *     dtoverlay=lm75-fan
+ *
+ * Compiled in-stage:  dtc -@ -I dts -O dtb -o lm75-fan.dtbo lm75-fan-overlay.dts
+ * (dtc -@ keeps __fixups__ so the RPi bootloader resolves &i2c1/&pwm/&gpio
+ *  against the base DTB at boot.)
+ *
+ * Hardware (4-pin PWM fan with tachometer):
+ *   - PWM in  -> GPIO18 (header pin 12)
+ *   - TACH    -> GPIO23 (header pin 16); open-collector, pull up to 3.3V ONLY
+ *               (a 5V pull-up back-feeds the GPIO and damages the Pi)
+ *   - Fan power (5V/12V) from its own rail, common ground with the Pi.
+ *   - Adjust lm75 'compatible'/'reg' and the GPIOs to match your board/part.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	/* 1) LM75 temperature sensor on I2C1 */
+	fragment@0 {
+		target = <&i2c1>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			lm75: temperature-sensor@48 {
+				compatible = "national,lm75";   /* match your part, e.g. ti,tmp75 / nxp,lm75a */
+				reg = <0x48>;
+				status = "okay";
+				/*
+				 * The hwmon core auto-registers temp1 as thermal
+				 * sensor index 0 (CONFIG_THERMAL_OF=y) even though lm75.c
+				 * has no thermal code. #thermal-sensor-cells is still
+				 * REQUIRED: the thermal-of parser reads it to decode the
+				 * sensor specifier <&lm75 0> (thermal_of.c:
+				 * of_parse_phandle_with_args), and errors without it.
+				 */
+				#thermal-sensor-cells = <1>;
+			};
+		};
+	};
+
+	/* 2) PWM fan (cooling device) on &pwm channel 0 (GPIO18) + tach on GPIO23 */
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			fan0: pwm-fan {
+				compatible = "pwm-fan";
+				pwms = <&pwm 0 40000 0>;        /* ch0, 40000ns = 25kHz */
+				#cooling-cells = <2>;
+				/* duty steps the governor can pick: idle, low, med, full */
+				cooling-levels = <0 102 170 255>;
+
+				/* tachometer -> RPM (hwmon fan1_input) */
+				interrupt-parent = <&gpio>;
+				interrupts = <23 2>;            /* GPIO23, 2 = IRQ_TYPE_EDGE_FALLING */
+				pulses-per-revolution = <2>;
+			};
+		};
+	};
+
+	/* 3) Thermal zone: LM75 drives the fan. THIS is the control loop. */
+	fragment@2 {
+		target-path = "/thermal-zones";
+		__overlay__ {
+			lm75_fan_thermal: lm75-fan-thermal {
+				polling-delay = <2000>;         /* ms, when idle */
+				polling-delay-passive = <1000>; /* ms, near a trip */
+				thermal-sensors = <&lm75 0>;    /* LM75 temp1 via hwmon core */
+
+				trips {
+					fan_low: trip-fan-low {
+						temperature = <45000>;  /* 45 C */
+						hysteresis = <5000>;
+						type = "active";
+					};
+					fan_high: trip-fan-high {
+						temperature = <60000>;  /* 60 C */
+						hysteresis = <5000>;
+						type = "active";
+					};
+				};
+
+				cooling-maps {
+					map_low {
+						trip = <&fan_low>;
+						cooling-device = <&fan0 1 2>;  /* levels idx 1..2 */
+					};
+					map_high {
+						trip = <&fan_high>;
+						cooling-device = <&fan0 2 3>;  /* levels idx 2..3 (full) */
+					};
+				};
+			};
+		};
+	};
+};

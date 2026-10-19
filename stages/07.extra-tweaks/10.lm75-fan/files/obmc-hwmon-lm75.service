@@ -1,0 +1,15 @@
+[Unit]
+Description=Configure and start phosphor-hwmon for the LM75 (demo)
+After=xyz.openbmc_project.ObjectMapper.service
+Wants=xyz.openbmc_project.ObjectMapper.service
+ConditionPathExists=/sys/class/hwmon
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The i2c/lm75 hwmon node may appear slightly after boot; retry briefly.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do grep -qx lm75 /sys/class/hwmon/hwmon*/name 2>/dev/null && exit 0; sleep 1; done; exit 0'
+ExecStart=/usr/bin/obmc-hwmon-dev-setup.sh lm75 /usr/share/lm75-fan/lm75-hwmon.conf
+
+[Install]
+WantedBy=multi-user.target
